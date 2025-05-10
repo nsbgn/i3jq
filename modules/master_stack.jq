@@ -1,19 +1,17 @@
-# This is a long-running script that implements a master-stack layout. That 
-# means that there is one "main" window and any additional window gets stacked 
-# to the side.
-
-# Note: To normalize a workspace:
-# 1. Put workspace in the correct orientation
-# 2. Identify the stack
-# 3. Flatten the stack
-# 4. Identify all windows that are *not* the stack.
-# 5. Move those to the front/back of the stack too.
-# 6. Move first/last window(s) in a direction orthogonal to the stack, until we
-# are in n-mode.
-# 7. Synchronize (ipc::send_tick("synchronize"))
+# This is a long-running script that implements a master-stack layout. That
+# means that there is one "main" window and any additional window gets stacked
+# to the side. An additional feature is an "overflow" number, which determines
+# how many windows can be in view at the same time before.
 
 import "builtin/ipc" as ipc;
 import "builtin/tree" as tree;
+
+def INITIAL_STATE: {
+  master: "left",
+  overflow: 2,
+  overflow_layout: "stacked",
+  # insert: end | beginning | before | after
+};
 
 # The mark to which to send new windows
 def INSERT: "insert";
@@ -66,7 +64,7 @@ def is_layout($orientation):
     ($orientation | axis) as $axis |
     ($orientation | position) as $i |
     .layout == $split[$axis]
-    and .nodes[$i].layout == $split[1-$axis] 
+    and .nodes[$i].layout == $split[1-$axis]
     and all(.nodes[:$i], .nodes[$i+1:], .nodes[$i].nodes[]; .layout == "none")
   ));
 
@@ -82,64 +80,75 @@ def ensure_marks($orientation):
   mark(SWAP; $monocle);
 
 # Organize a workspace into a master-stack layout. The master-stack layout is a
-# single container on the top level (the layout-root) containing one leaf
-# window (the master) and potentially one more container (the stack). The
-# latter contains the rest of the leaf windows. This filter makes no assumption
-# about the current state of the layout tree.
+# single container at the top level (the holder) containing one leaf window
+# (the master) and potentially one more container (the stack). The latter
+# contains the rest of the leaf windows. This filter makes no assumption about
+# the current state of the layout tree.
 def apply_layout($orientation):
-  (.nodes | length) as $n |
-  ["splith", "splitv"] as $split |
-  ["horizontal", "vertical"] as $splits |
+  tree::find(any(.marks[]; . == SWAP)) as $swap_mark_available |
+  "hv" as $split |
   ($orientation | axis) as $axis |
   ($orientation | position) as $i |
+  $split[$axis] as $orientn_holder |
+  $split[1-$axis] as $orientn_stack |
 
   # If the workspace is now entirely empty, we just need to make sure that any
   # new window opened won't appear in some other workspace.
-  if $n == 0 then
+  if (.nodes | length) == 0 then
     "unmark \(SWAP); unmark \(INSERT)"
   else
-    # Otherwise, we can descend into the layout-root.
+    # Otherwise, we can descend into the holder.
     # TODO: Move excess windows
+    [.nodes[1:].[] | tree::leaves] as $excess |
     .nodes[0] |
-    (.nodes | length) as $n |
+    . as $holder |
+    (.nodes | length) as $n_holder |
 
-    # If the layout-root is itself a leaf node, it needs to be split and
-    # correct marks set
-    if $n == 0 then
+    # If the holder is itself a leaf node, it needs to be split and correct
+    # marks set
+    if $n_holder == 0 then
       mark(INSERT),
       mark(SWAP; $i == 0),
-      "[con_id=\(.id)] split \($splits[$axis])"
+      "[con_id=\(.id)] split \($orientn_holder)"
+    # Otherwise, at least make sure that the holder has the correct layout
+    else
+      if .layout != "split\($orientn_holder)" then
+        "[con_id=\(.nodes[0].id)] layout split\($orientn_holder)"
+      else
+        empty
+      end
+    end,
 
     # If it is split already, but contains only one node:
-    elif $n == 1 then
+    if $n_holder == 1 then
       .nodes[0] |
-      (.nodes | length) as $n |
 
-      if $n == 0 then
+      # If it contains just a leaf window, that is the master window; mark
+      # accordingly.
+      if .layout == "none" then
         mark(INSERT),
         mark(SWAP; $i == 0)
-      elif $n == 1 then
-        # TODO: We assume here that the node underneath *this* is a leaf, which
-        # is not necessarily true
-        .nodes[0] |
-        "[con_id=\(.id)] split none",
-        mark(INSERT),
-        mark(SWAP; $i == 0)
+      # Otherwise, we are dealing with a bare stack.
+      # When there is only one top-level node, we want to assume that there
+      # is also just one master window, but that might not be true if we just
+      # closed the previous master window. Then this node is the stack. In
+      # that case, we select the second most recently focused window in this
+      # stack and promote it to master
       else
-        # When there is only one top-level node, we want to assume that there
-        # is also just one master window, but that might not be true if we just
-        # closed the previous master window. Then this node is the stack. In
-        # that case, we select the second most recently focused window in this
-        # stack and promote it to master
-        (tree::focused_child(1) | "[con_id=\(.id)] move right"), # TODO
-        (tree::focused_child(0) |
-        mark(INSERT),
-        mark(SWAP; $i == 0))
+        [tree::leaves] as $leaves |
+        $leaves[$i] as $master |
+        . as $stack |
+        "[con_id=\($stack.id)] mark --add _swayq_stack",
+        ($leaves.[] | select(.id != $master.id) | "[con_id=\(.id)] move to mark _swayq_stack"),
+        "[con_id=\($stack.id)] unmark _swayq_stack",
+        "[con_id=\($holder.id)] mark --add _swayq_holder",
+        "[con_id=\($master.id)] move to mark _swayq_holder",
+        "[con_id=\($holder.id)] unmark _swayq_holder"
       end
 
     # We already have both a master and stack container
     # TODO: We assume that we *only* have these
-    elif $n > 1 then
+    elif $n_holder > 1 then
       .nodes[-(1+$i)] as $master |
       .nodes[$i] as $stack |
       $stack |
@@ -151,6 +160,8 @@ def apply_layout($orientation):
         mark(INSERT)
       end,
       mark(SWAP; false)
+    else
+      empty
     end
   end;
 
@@ -169,7 +180,7 @@ def main:
     if $e.event == "tick" then
       {stack: .stack, payload: $e.payload}
     end;
-    . as {$stack, $n} | $e |
+    . as {$stack} | $e |
     if is_event("window"; "new", "close") or is_event("workspace"; "focus") then
       do(
         ipc::get_tree |
