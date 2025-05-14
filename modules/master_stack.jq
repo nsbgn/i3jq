@@ -31,8 +31,8 @@ def base: {
   # The layout of this container
   layout: "splith", # TODO: Determine from workspace
 
-  # The schema for the overflow node
-  overflow: {}
+  # The schema for the overflow node, if not the same as the root schema
+  overflow: null
 };
 
 def master_stack: {
@@ -123,12 +123,12 @@ def ensure_marks($orientation):
 # at each step, we can access the container's id and the attributes of any
 # child that is not (and does not have any descendants of) a container that may
 # have already moved.
-def normalize($schema; $orig_schema; $leaves):
+def normalize($schema; $root_schema; $leaves):
   if .type != "con" then
     "Can only normalize containers." | error
   end |
 
-  (base + $schema) as {$forward, $capacity, $layout, $overflow} |
+  $schema as {$forward, $capacity, $layout, overflow: $overflow_schema} |
 
   # Organize $leaves into $leaders and $followers, according to the
   # schema's capacity and direction. $followers are those windows that are in
@@ -143,10 +143,9 @@ def normalize($schema; $orig_schema; $leaves):
   # does not contain any $leaders (because we cannot risk it vanishing during
   # our processing), or otherwise an arbitrary $followers node (in which case
   # it will be used for creating a new split).
-  ( first(.nodes[] | select(
-      .layout != "none" and
-      all($leaders[]; .id as $id | tree::find(.id == $id) == null)))
-    // $followers[if $forward then 0 else -1 end]
+  ( first(.nodes[] | select(.layout != "none" and (
+      .id as $id | $leaders | all(tree::find(.id == $id) == null))))
+    // $followers[0]
   ) as $overflow_node |
 
   if $forward then
@@ -169,8 +168,16 @@ def normalize($schema; $orig_schema; $leaves):
   # then move all leaders and the $overflow_node (or vice versa) to this
   # container.
   if [.nodes[].id] != [$content[].id] then
-    "[con_id=\(.id)] mark --add \(TMP)",
-    ($content[] | "[con_id=\(.id)] move to mark \(TMP)"),
+    . as $self |
+    "[con_id=\(.id)] mark --add \(TMP)", (
+      $content |
+      if $self.layout == "none" then
+        reverse
+      end |
+      .[] |
+      select(.id != $self.id) |
+      "[con_id=\(.id)] move to mark \(TMP)"
+    ),
     "[con_id=\(.id)] unmark \(TMP)"
   else
     empty
@@ -178,7 +185,10 @@ def normalize($schema; $orig_schema; $leaves):
 
   # Finally, recursively apply the normalization step to the $overflow_node.
   ($overflow_node // empty |
-  normalize($schema + ($overflow // $orig_schema); $orig_schema; $followers));
+  normalize(
+    $schema | del(.overflow) + ($overflow_schema // $root_schema);
+    $root_schema;
+    $followers));
 
 def normalize($schema):
   [tree::leaves] as $leaves |
@@ -189,7 +199,7 @@ def normalize($schema):
       empty
     end
   end |
-
+  (base + $schema) as $schema |
   normalize($schema; $schema; $leaves);
 
 def init:
